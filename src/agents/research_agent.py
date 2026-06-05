@@ -1,418 +1,269 @@
 """
-Production-ready AI Research Agent with LangChain
-Implements intelligent content research with reasoning and planning
+Research Agent — multi-provider LLM + multi-provider search.
+
+No LangChain required. Uses the LLMRouter directly for provider-agnostic
+LLM calls (Anthropic / OpenAI / Groq / Gemini) and SearchProviderManager
+for concurrent multi-source search.
+
+Two modes:
+  - With LLM key: search → analyze top sources → synthesize into ResearchReport
+  - Without LLM key: search → return raw ranked results with no synthesis
 """
 import asyncio
+import json
 import logging
 import re
-from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
-import json
-
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain.tools import Tool
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.callbacks import get_openai_callback
+from typing import Any, Dict, List, Optional
 
 from src.config import get_settings
-from src.search.providers import SearchProviderManager
 from src.content.analyzer import ContentAnalyzer
+from src.llm.router import LLMRouter
+from src.search.providers import SearchProviderManager, SearchResult
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ResearchTask:
-    """Represents a research task with context"""
     topic: str
     keywords: List[str]
-    max_results: int = 5
+    max_results: int = 8
     focus_areas: List[str] = field(default_factory=list)
-    content_types: List[str] = field(default_factory=list)
+    depth: str = "standard"  # "quick" | "standard" | "deep"
 
 
 @dataclass
-class ResearchResult:
-    """Represents the result of research with AI analysis"""
+class SourceSummary:
+    """One analyzed source."""
     title: str
     url: str
-    content_summary: str
-    relevance_score: float
+    summary: str
     key_insights: List[str]
+    relevance_score: float
+    authority_score: float
     sentiment: str
     content_type: str
-    source_authority: float
-    publish_date: Optional[datetime] = None
-    tags: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ResearchReport:
+    """
+    Structured research output — not just a list of URLs.
+
+    executive_summary: 2-3 sentence synthesis of findings.
+    key_findings: top 5-7 insights across all sources.
+    sources: individually analyzed source summaries.
+    confidence: overall confidence in the research (0-1).
+    llm_provider: which LLM synthesized this report (or None).
+    """
+    topic: str
+    executive_summary: str
+    key_findings: List[str]
+    sources: List[SourceSummary]
+    confidence: float
+    generated_at: datetime
+    llm_provider: Optional[str]
+    search_providers: List[str]
+    raw_mode: bool = False  # True when no LLM available
 
 
 class ResearchAgent:
     """
-    Intelligent research agent that uses AI to plan, execute, and analyze content research.
+    Researches any topic using concurrent multi-source search and LLM synthesis.
 
-    Architecture:
-    - SearchProviderManager: concurrent multi-provider search with deduplication
-    - ContentAnalyzer: per-URL AI analysis (key insights, sentiment, quality score)
-    - LangChain AgentExecutor: orchestrates tool calls across up to 5 iterations
+    Free tier (no LLM key set):
+      - Uses DuckDuckGo for search
+      - Returns ranked results without synthesis
+      - Set GROQ_API_KEY or GEMINI_API_KEY for free LLM synthesis
+
+    Paid tier (with LLM key):
+      - SerpAPI + Tavily for best search coverage
+      - Claude or GPT-4o for deep synthesis
+      - Full ResearchReport with executive summary and key findings
+
+    Provider priority: Anthropic > OpenAI > Groq > Gemini
     """
 
-    def __init__(self):
+    def __init__(self, preferred_llm: Optional[str] = None):
         self.settings = get_settings()
-        self.search_manager = SearchProviderManager()
-        self.content_analyzer = ContentAnalyzer()
-
-        # Initialize LLM with fallback
-        self.llm = self._initialize_llm()
-        self.memory = ConversationBufferWindowMemory(
-            k=5,
-            return_messages=True,
-            memory_key="chat_history"
+        self.llm = LLMRouter(
+            preferred_provider=preferred_llm or self.settings.preferred_llm,
+            max_tokens=self.settings.max_llm_tokens,
+        )
+        self.search = SearchProviderManager()
+        self.analyzer = ContentAnalyzer()
+        logger.info(
+            f"ResearchAgent ready. LLM: {self.llm.provider_name or 'none (raw mode)'}. "
+            f"Search: {self.settings.available_search_providers}"
         )
 
-        # Initialize agent tools
-        self.tools = self._create_tools()
-        self.agent_executor = self._create_agent()
+    async def research(self, task: ResearchTask) -> ResearchReport:
+        """
+        Main entry point. Returns a ResearchReport.
 
-        logger.info(f"ResearchAgent initialized with LLM: {self.llm.model_name if self.llm else 'None'}")
+        Steps:
+          1. Concurrent search across all configured providers
+          2. Analyze top N sources (fetch content + AI analysis)
+          3. Synthesize findings into a structured report via LLM
+        """
+        logger.info(f"Researching: '{task.topic}' | depth={task.depth} | max={task.max_results}")
 
-    def _initialize_llm(self) -> Optional[ChatOpenAI]:
-        """Initialize LLM with automatic fallback"""
+        # 1. Search
+        query = f"{task.topic} {' '.join(task.keywords)}"
+        search_results = await self.search.search(query, max_results=task.max_results)
+
+        if not search_results:
+            logger.warning("No search results found.")
+            return self._empty_report(task)
+
+        # 2. Analyze sources (limit analysis depth by task.depth)
+        analyze_count = {"quick": 3, "standard": 5, "deep": len(search_results)}.get(task.depth, 5)
+        sources = await self._analyze_sources(search_results[:analyze_count])
+
+        # 3. Synthesize
+        if self.llm.available:
+            return await self._synthesize(task, sources)
+        else:
+            return self._raw_report(task, sources)
+
+    async def _analyze_sources(self, results: List[SearchResult]) -> List[SourceSummary]:
+        """Analyze each search result concurrently."""
+        tasks = [self._analyze_one(r) for r in results]
+        summaries = await asyncio.gather(*tasks, return_exceptions=True)
+        return [s for s in summaries if isinstance(s, SourceSummary)]
+
+    async def _analyze_one(self, result: SearchResult) -> SourceSummary:
+        """Analyze a single search result."""
         try:
-            if self.settings.has_openai:
-                return ChatOpenAI(
-                    model=self.settings.default_llm_model,
-                    temperature=self.settings.temperature,
-                    max_tokens=self.settings.max_tokens_per_request,
-                    openai_api_key=self.settings.openai_api_key
-                )
-            else:
-                logger.warning("No LLM provider configured, using mock responses")
-                return None
+            analysis = await self.analyzer.analyze_url(result.url)
+            return SourceSummary(
+                title=result.title,
+                url=result.url,
+                summary=analysis.get("summary", result.snippet),
+                key_insights=analysis.get("key_insights", [result.snippet]),
+                relevance_score=result.relevance_score,
+                authority_score=result.authority_score,
+                sentiment=analysis.get("sentiment", "neutral"),
+                content_type=analysis.get("content_type", "article"),
+            )
         except Exception as e:
-            logger.error(f"Failed to initialize primary LLM: {e}")
-            try:
-                return ChatOpenAI(
-                    model=self.settings.fallback_llm_model,
-                    temperature=self.settings.temperature,
-                    max_tokens=2000,
-                    openai_api_key=self.settings.openai_api_key
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize fallback LLM: {e}")
-                return None
-
-    def _create_tools(self) -> List[Tool]:
-        """Create tools for the agent"""
-        tools = []
-
-        # Web Search Tool
-        def search_web(query: str) -> str:
-            """Search the web for relevant content"""
-            try:
-                # Run async search in sync context
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    results = loop.run_until_complete(self.search_manager.search(query, max_results=5))
-                    # Convert search results to dictionary format
-                    formatted_results = []
-                    for result in results:
-                        formatted_results.append({
-                            "title": result.title,
-                            "url": result.url,
-                            "snippet": result.snippet,
-                            "source": result.source,
-                            "relevance_score": result.relevance_score,
-                            "authority_score": result.authority_score
-                        })
-                    return json.dumps(formatted_results, indent=2)
-                finally:
-                    loop.close()
-            except Exception as e:
-                logger.error(f"Search tool error: {e}")
-                return f"Search failed: {str(e)}"
-
-        tools.append(Tool(
-            name="web_search",
-            description="Search the web for current information about a topic. Use this to find recent articles, news, and relevant content.",
-            func=search_web
-        ))
-
-        # Content Analysis Tool
-        def analyze_content(url_or_text: str) -> str:
-            """Analyze content for relevance and insights"""
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    if url_or_text.startswith('http'):
-                        analysis = loop.run_until_complete(self.content_analyzer.analyze_url(url_or_text))
-                    else:
-                        analysis = loop.run_until_complete(self.content_analyzer.analyze_text(url_or_text))
-                    return json.dumps(analysis, indent=2)
-                finally:
-                    loop.close()
-            except Exception as e:
-                logger.error(f"Content analysis error: {e}")
-                return f"Analysis failed: {str(e)}"
-
-        tools.append(Tool(
-            name="analyze_content",
-            description="Analyze content from a URL or text for relevance, sentiment, and key insights.",
-            func=analyze_content
-        ))
-
-        return tools
-
-    def _create_agent(self) -> Optional[AgentExecutor]:
-        """Create the research agent"""
-        if not self.llm:
-            return None
-
-        # System prompt — kept as written in production, no token optimizer needed here
-        system_prompt = """
-        You are an expert AI research assistant specializing in content discovery and analysis.
-        Your goal: Find highly relevant, current content on given topics with deep insights.
-
-        WORKFLOW:
-        1. PLAN: Analyze the research request and create search strategy
-        2. SEARCH: Execute targeted searches using available tools
-        3. ANALYZE: Evaluate content quality, relevance, and insights
-        4. SYNTHESIZE: Compile findings with actionable intelligence
-
-        SEARCH STRATEGY:
-        - Use multiple search queries with different angles
-        - Focus on recent, authoritative sources
-        - Prioritize diverse content types (news, analysis, reports)
-        - Look for emerging trends and expert opinions
-
-        ANALYSIS CRITERIA:
-        - Relevance to user's specific interests
-        - Content freshness and accuracy
-        - Source authority and credibility
-        - Unique insights and perspectives
-        - Actionable information
-
-        OUTPUT FORMAT:
-        Always provide structured findings with:
-        - Title and URL
-        - Key insights (3-5 bullet points)
-        - Relevance score (1-10)
-        - Content type and authority
-        - Recommended action
-
-        Be efficient, thorough, and focus on high-value content.
-        """
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            MessagesPlaceholder("chat_history", optional=True),
-            ("human", "{input}"),
-            MessagesPlaceholder("agent_scratchpad")
-        ])
-
-        agent = create_openai_tools_agent(
-            llm=self.llm,
-            tools=self.tools,
-            prompt=prompt
-        )
-
-        return AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            memory=self.memory,
-            verbose=True,
-            max_iterations=5,
-            max_execution_time=60,
-            early_stopping_method="generate"
-        )
-
-    async def research_topic(self, task: ResearchTask) -> List[ResearchResult]:
-        """
-        Main method to research a topic using AI agent reasoning.
-        Falls back to direct search if agent/LLM is unavailable.
-        """
-        logger.info(f"Starting AI research for topic: {task.topic}")
-
-        if not self.agent_executor:
-            logger.warning("No agent available, using fallback research")
-            return await self._fallback_research(task)
-
-        try:
-            # Create research query
-            research_query = self._create_research_query(task)
-
-            # Track token usage
-            with get_openai_callback() as cb:
-                # Execute agent research
-                response = await asyncio.to_thread(
-                    self.agent_executor.invoke,
-                    {"input": research_query}
-                )
-
-                logger.info(f"Research completed. Tokens used: {cb.total_tokens}")
-
-            # Parse and structure results
-            results = await self._parse_agent_results(response, task)
-
-            logger.info(f"Found {len(results)} high-quality research results")
-            return results
-
-        except Exception as e:
-            logger.error(f"Agent research failed: {e}")
-            return await self._fallback_research(task)
-
-    def _create_research_query(self, task: ResearchTask) -> str:
-        """Create a research query for the agent"""
-        focus_context = ""
-        if task.focus_areas:
-            focus_context = f" with focus on: {', '.join(task.focus_areas)}"
-
-        content_context = ""
-        if task.content_types:
-            content_context = f" looking for: {', '.join(task.content_types)}"
-
-        query = f"""
-        Research Topic: {task.topic}
-        Keywords: {', '.join(task.keywords)}
-        {focus_context}
-        {content_context}
-
-        Find {task.max_results} most relevant, high-quality pieces of content.
-        Prioritize recent, authoritative sources with unique insights.
-        Analyze each piece for relevance, credibility, and actionable value.
-        """
-
-        return query.strip()
-
-    async def _parse_agent_results(self, response: Dict[str, Any], task: ResearchTask) -> List[ResearchResult]:
-        """Parse agent response into structured research results"""
-        results = []
-
-        try:
-            # Extract structured data from agent response
-            output = response.get('output', '')
-
-            logger.info(f"Agent response length: {len(output)} characters")
-            logger.info(f"Agent response preview: {output[:500]}...")
-
-            # Try to extract URLs and titles from the response using regex
-            url_pattern = r'https?://[^\s\)\]]+'
-            title_pattern = r'(?:Title:|title:|[*#]+\s*)([^\n]+?)(?:\n|$)'
-
-            urls = re.findall(url_pattern, output)
-            titles = re.findall(title_pattern, output, re.IGNORECASE)
-
-            logger.info(f"Found {len(urls)} URLs and {len(titles)} titles in response")
-
-            # Create results from extracted data
-            for i, url in enumerate(urls[:task.max_results]):
-                title = titles[i] if i < len(titles) else f"Research Finding {i+1}"
-                title = title.strip('*# ').strip()
-
-                # Extract content around the URL for summary
-                url_pos = output.find(url)
-                context_start = max(0, url_pos - 200)
-                context_end = min(len(output), url_pos + 300)
-                context = output[context_start:context_end]
-
-                # Clean up the context for summary
-                summary_lines = []
-                for line in context.split('\n'):
-                    line = line.strip()
-                    if line and not line.startswith('http') and len(line) > 10:
-                        summary_lines.append(line)
-
-                summary = ' '.join(summary_lines[:3])  # First 3 relevant lines
-                if not summary:
-                    summary = f"Research content related to {task.topic}"
-
-                # Extract key insights from the context
-                key_insights = []
-                if "key insights" in context.lower() or "insights" in context.lower():
-                    insight_lines = [line.strip() for line in context.split('\n')
-                                     if line.strip() and ('•' in line or '-' in line.strip()[:2])]
-                    key_insights = [line.strip('• -').strip() for line in insight_lines[:3]]
-
-                if not key_insights:
-                    key_insights = [
-                        f"Relevant information about {task.topic}",
-                        "High-quality research source identified",
-                        "Content validated by AI analysis"
-                    ]
-
-                results.append(ResearchResult(
-                    title=title,
-                    url=url,
-                    content_summary=summary[:500],  # Limit summary length
-                    relevance_score=8.5,  # Default high relevance since AI selected it
-                    key_insights=key_insights,
-                    sentiment='neutral',
-                    content_type='research',
-                    source_authority=8.0,  # High authority since found by AI
-                    tags=task.keywords
-                ))
-
-            logger.info(f"Successfully parsed {len(results)} results from agent response")
-
-        except Exception as e:
-            logger.error(f"Error parsing agent results: {e}")
-
-        # If no results parsed, use fallback
-        if not results:
-            logger.warning("No results parsed from agent, using fallback")
-            results = await self._fallback_research(task)
-
-        return results[:task.max_results]
-
-    async def _fallback_research(self, task: ResearchTask) -> List[ResearchResult]:
-        """
-        Fallback research method when agent is unavailable.
-        Calls SearchProviderManager directly — no LLM required.
-        """
-        logger.info("Using fallback research method")
-
-        try:
-            # Use direct search without agent
-            search_results = await self.search_manager.search(
-                f"{task.topic} {' '.join(task.keywords)}",
-                max_results=task.max_results
+            logger.warning(f"Analysis failed for {result.url}: {e}")
+            return SourceSummary(
+                title=result.title,
+                url=result.url,
+                summary=result.snippet,
+                key_insights=[result.snippet],
+                relevance_score=result.relevance_score,
+                authority_score=result.authority_score,
+                sentiment="neutral",
+                content_type="article",
             )
 
-            results = []
-            for item in search_results:
-                results.append(ResearchResult(
-                    title=item.title,
-                    url=item.url,
-                    content_summary=item.snippet or 'Content analysis pending',
-                    relevance_score=item.relevance_score or 8.0,
-                    key_insights=[
-                        f"Related to {task.topic}",
-                        "Requires further analysis",
-                        "Potentially valuable content"
-                    ],
-                    sentiment='neutral',
-                    content_type='article',
-                    source_authority=item.authority_score or 7.0,
-                    tags=task.keywords
-                ))
+    async def _synthesize(self, task: ResearchTask, sources: List[SourceSummary]) -> ResearchReport:
+        """Use the LLM to synthesize sources into a structured report."""
+        sources_text = "\n\n".join([
+            f"Source {i+1}: {s.title}\nURL: {s.url}\nSummary: {s.summary}\n"
+            f"Key Insights: {'; '.join(s.key_insights)}\n"
+            f"Relevance: {s.relevance_score:.1f} | Authority: {s.authority_score:.1f}"
+            for i, s in enumerate(sources)
+        ])
 
-            return results
+        focus_context = ""
+        if task.focus_areas:
+            focus_context = f"\nFocus specifically on: {', '.join(task.focus_areas)}"
 
-        except Exception as e:
-            logger.error(f"Fallback research failed: {e}")
-            return []
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert research analyst. You synthesize information from "
+                    "multiple sources into structured, actionable research reports. "
+                    "Be concise, specific, and cite sources by their index number."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Topic: {task.topic}\n"
+                    f"Keywords: {', '.join(task.keywords)}{focus_context}\n\n"
+                    f"Sources:\n{sources_text}\n\n"
+                    "Produce a JSON research report with exactly these keys:\n"
+                    "{\n"
+                    '  "executive_summary": "2-3 sentence synthesis of all findings",\n'
+                    '  "key_findings": ["finding 1", "finding 2", ... (5-7 items)"],\n'
+                    '  "confidence": 0.85\n'
+                    "}\n\n"
+                    "Rules: be specific, reference sources by index, no filler phrases. "
+                    "Confidence should reflect source quality and agreement (0.0-1.0). "
+                    "Return only valid JSON."
+                ),
+            },
+        ]
 
-    def get_agent_status(self) -> Dict[str, Any]:
-        """Get current agent status and capabilities"""
+        raw = await asyncio.to_thread(self.llm.call, messages)
+
+        try:
+            # Strip markdown code fences if present
+            clean = re.sub(r"```(?:json)?\n?", "", raw or "").strip().rstrip("`")
+            data = json.loads(clean)
+            return ResearchReport(
+                topic=task.topic,
+                executive_summary=data.get("executive_summary", ""),
+                key_findings=data.get("key_findings", []),
+                sources=sources,
+                confidence=float(data.get("confidence", 0.7)),
+                generated_at=datetime.now(),
+                llm_provider=self.llm.provider_name,
+                search_providers=self.settings.available_search_providers,
+            )
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Failed to parse LLM synthesis response: {e}")
+            # Return a partial report with the raw LLM text as summary
+            return ResearchReport(
+                topic=task.topic,
+                executive_summary=raw or "Synthesis failed — see raw sources below.",
+                key_findings=[],
+                sources=sources,
+                confidence=0.5,
+                generated_at=datetime.now(),
+                llm_provider=self.llm.provider_name,
+                search_providers=self.settings.available_search_providers,
+            )
+
+    def _raw_report(self, task: ResearchTask, sources: List[SourceSummary]) -> ResearchReport:
+        """No LLM available — return ranked sources without synthesis."""
+        return ResearchReport(
+            topic=task.topic,
+            executive_summary=(
+                f"Raw results for '{task.topic}'. "
+                "Set GROQ_API_KEY (free) or ANTHROPIC_API_KEY for synthesized reports."
+            ),
+            key_findings=[s.summary for s in sources[:5] if s.summary],
+            sources=sources,
+            confidence=0.5,
+            generated_at=datetime.now(),
+            llm_provider=None,
+            search_providers=self.settings.available_search_providers,
+            raw_mode=True,
+        )
+
+    def _empty_report(self, task: ResearchTask) -> ResearchReport:
+        return ResearchReport(
+            topic=task.topic,
+            executive_summary="No results found. Try different keywords.",
+            key_findings=[],
+            sources=[],
+            confidence=0.0,
+            generated_at=datetime.now(),
+            llm_provider=None,
+            search_providers=self.settings.available_search_providers,
+        )
+
+    def status(self) -> Dict[str, Any]:
         return {
-            "agent_available": bool(self.agent_executor),
-            "llm_model": self.llm.model_name if self.llm else None,
-            "available_tools": [tool.name for tool in self.tools],
+            "llm": self.llm.status(),
             "search_providers": self.settings.available_search_providers,
-            "llm_providers": self.settings.available_llm_providers,
-            "memory_window": self.memory.k if self.memory else 0
+            "ready": True,
         }

@@ -1,5 +1,10 @@
 """
-Demo: research a topic and print structured results.
+Demo: Research Agent
+
+Works with any combination of API keys you have.
+No keys at all: uses DuckDuckGo + returns raw results.
+Free keys (Groq/Gemini): full synthesized report at no cost.
+Paid keys (Anthropic/OpenAI): highest quality research.
 
 Usage:
     pip install -r requirements.txt

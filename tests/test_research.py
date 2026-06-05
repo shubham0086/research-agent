@@ -1,8 +1,6 @@
 """
-Tests for the research agent — agent init, search fallback, provider status.
-
-Run with:
-    pytest tests/ -v
+Tests for research agent, LLM router, and search layer.
+Run: pytest tests/ -v
 """
 import asyncio
 import sys
@@ -12,174 +10,194 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.agents.research_agent import ResearchAgent, ResearchTask, ResearchResult
+import src.config as cfg
 from src.search.providers import SearchProviderManager, SearchResult, DuckDuckGoProvider
-from src.config import Settings
+from src.llm.router import LLMRouter
+from src.agents.research_agent import ResearchAgent, ResearchTask, ResearchReport
+
+
+def reset_settings():
+    cfg._settings = None
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# LLMRouter tests
 # ---------------------------------------------------------------------------
 
-def make_task(**kwargs) -> ResearchTask:
-    defaults = dict(topic="AI agents", keywords=["LLM", "agent"], max_results=3)
-    defaults.update(kwargs)
-    return ResearchTask(**defaults)
+def test_router_no_keys_returns_unavailable(monkeypatch):
+    """Router with no keys configured should report unavailable."""
+    for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    router = LLMRouter()
+    assert router.available is False
+    assert router.provider_name is None
+    assert router.tier == "none"
 
 
-# ---------------------------------------------------------------------------
-# 1. Agent initialises cleanly with no API keys configured
-# ---------------------------------------------------------------------------
+def test_router_detects_anthropic_key(monkeypatch):
+    """Router should pick Anthropic when ANTHROPIC_API_KEY is set."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    for key in ["OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    router = LLMRouter()
+    assert router.available is True
+    assert router.provider_name == "Anthropic"
+    assert router.tier == "paid"
 
-def test_agent_init_no_keys(monkeypatch):
-    """Agent should initialise without raising even when all API keys are absent."""
+
+def test_router_falls_back_to_groq_when_no_paid_key(monkeypatch):
+    """Router should fall back to Groq (free) when no paid keys are set."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("SERP_API_KEY", raising=False)
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
-
-    # Reset cached settings singleton so monkeypatched env is picked up
-    import src.config as cfg
-    cfg._settings = None
-
-    agent = ResearchAgent()
-
-    assert agent.llm is None
-    assert agent.agent_executor is None
-    assert len(agent.tools) == 2  # web_search + analyze_content always registered
-
-    cfg._settings = None  # clean up
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    router = LLMRouter()
+    assert router.provider_name == "Groq"
+    assert router.tier == "free"
 
 
-# ---------------------------------------------------------------------------
-# 2. get_agent_status returns expected keys
-# ---------------------------------------------------------------------------
+def test_router_status_shows_all_providers(monkeypatch):
+    """status() should list all four providers with their configured state."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    for key in ["OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    router = LLMRouter()
+    status = router.status()
+    assert "active_provider" in status
+    assert "available_providers" in status
+    assert len(status["available_providers"]) == 4
+    names = [p["name"] for p in status["available_providers"]]
+    assert "Anthropic" in names
+    assert "Groq" in names
 
-def test_agent_status_keys(monkeypatch):
-    """get_agent_status must return the documented keys."""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    import src.config as cfg
-    cfg._settings = None
 
-    agent = ResearchAgent()
-    status = agent.get_agent_status()
-
-    assert "agent_available" in status
-    assert "llm_model" in status
-    assert "available_tools" in status
-    assert "search_providers" in status
-    assert "llm_providers" in status
-    assert "memory_window" in status
-
-    cfg._settings = None
+def test_router_call_returns_none_when_unavailable(monkeypatch):
+    """call() should return None gracefully when no provider is configured."""
+    for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    router = LLMRouter()
+    result = router.call([{"role": "user", "content": "hello"}])
+    assert result is None
 
 
 # ---------------------------------------------------------------------------
-# 3. SearchProviderManager falls back to DuckDuckGo when no keys are set
+# Search provider tests
 # ---------------------------------------------------------------------------
 
-def test_provider_manager_duckduckgo_fallback(monkeypatch):
-    """With no paid API keys, SearchProviderManager should use DuckDuckGo."""
-    monkeypatch.delenv("SERP_API_KEY", raising=False)
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
-
-    import src.config as cfg
-    cfg._settings = None
-
+def test_provider_manager_uses_duckduckgo_when_no_keys(monkeypatch):
+    """With no paid search keys, manager should use DuckDuckGo."""
+    for key in ["SERP_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    reset_settings()
     manager = SearchProviderManager()
-    provider_names = [p.name for p in manager.providers]
+    names = [p.name for p in manager.providers]
+    assert "DuckDuckGo" in names
+    reset_settings()
 
-    assert "DuckDuckGo" in provider_names
-    assert len(manager.providers) == 1  # only the fallback
-
-    cfg._settings = None
-
-
-# ---------------------------------------------------------------------------
-# 4. SearchProviderManager.search deduplicates results
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_search_deduplication(monkeypatch):
-    """
-    If two providers return the same URL, the manager should deduplicate it
-    so the final result list contains it only once.
-    """
-    monkeypatch.delenv("SERP_API_KEY", raising=False)
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
-    import src.config as cfg
-    cfg._settings = None
+async def test_search_deduplicates_urls(monkeypatch):
+    """Manager should return each URL only once across providers."""
+    for key in ["SERP_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    reset_settings()
 
-    duplicate_result = SearchResult(
-        title="Duplicate Article",
-        url="https://example.com/article",
-        snippet="Same article returned by two providers",
-        source="MockProvider",
-        relevance_score=8.0,
-        authority_score=7.0
+    dup = SearchResult(
+        title="Dup", url="https://example.com/a",
+        snippet="x", source="Mock",
+        relevance_score=8.0, authority_score=7.0,
     )
-
     manager = SearchProviderManager()
 
-    # Patch _search_with_provider to return the same result twice
     async def fake_search(provider, query, max_results):
-        return [duplicate_result]
+        return [dup]
 
     manager._search_with_provider = fake_search
+    fake = MagicMock()
+    fake.name = "FakeProvider2"
+    fake.can_search.return_value = True
+    manager.providers = [manager.providers[0], fake]
 
-    # Add a second fake provider so the loop runs twice
-    fake_provider_2 = MagicMock()
-    fake_provider_2.name = "FakeProvider2"
-    fake_provider_2.can_search.return_value = True
-    manager.providers = [manager.providers[0], fake_provider_2]
-
-    results = await manager.search("test query", max_results=10)
-
-    # The duplicate URL should appear exactly once
-    urls = [r.url for r in results]
-    assert urls.count("https://example.com/article") == 1
-
-    cfg._settings = None
+    results = await manager.search("test", max_results=10)
+    assert [r.url for r in results].count("https://example.com/a") == 1
+    reset_settings()
 
 
 # ---------------------------------------------------------------------------
-# 5. Fallback research returns results without an LLM
+# ResearchAgent integration tests
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fallback_research_without_llm(monkeypatch):
-    """
-    _fallback_research should return ResearchResult objects using only the
-    search layer — no LLM call required.
-    """
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("SERP_API_KEY", raising=False)
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
-    import src.config as cfg
-    cfg._settings = None
+async def test_agent_returns_raw_report_without_llm(monkeypatch):
+    """Agent should return a raw ResearchReport when no LLM is configured."""
+    for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+                "SERP_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    reset_settings()
+
+    mock_result = SearchResult(
+        title="AI Agents in Production",
+        url="https://example.com/ai-agents",
+        snippet="How teams are deploying LLM agents at scale.",
+        source="DuckDuckGo",
+        relevance_score=8.5,
+        authority_score=7.0,
+    )
 
     agent = ResearchAgent()
+    agent.search.search = AsyncMock(return_value=[mock_result])
+    agent.analyzer.analyze_url = AsyncMock(return_value={
+        "summary": "Covers production deployment patterns for LLM agents.",
+        "key_insights": ["Routing is key", "Fallbacks prevent downtime"],
+        "sentiment": "positive",
+        "content_type": "article",
+    })
 
-    # Patch search manager to return a controlled result
+    task = ResearchTask(topic="AI agent deployment", keywords=["LLM", "production"])
+    report = await agent.research(task)
+
+    assert isinstance(report, ResearchReport)
+    assert report.raw_mode is True
+    assert report.llm_provider is None
+    assert len(report.sources) == 1
+    reset_settings()
+
+
+@pytest.mark.asyncio
+async def test_agent_synthesizes_report_with_llm(monkeypatch):
+    """Agent should produce a synthesized report when an LLM is available."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    for key in ["OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+                "SERP_API_KEY", "TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"]:
+        monkeypatch.delenv(key, raising=False)
+    reset_settings()
+
     mock_result = SearchResult(
-        title="Test Article",
-        url="https://example.com/test",
-        snippet="This is a test article snippet.",
+        title="RAG Systems 2025",
+        url="https://example.com/rag",
+        snippet="Best practices for RAG pipelines.",
         source="DuckDuckGo",
-        relevance_score=7.0,
-        authority_score=6.0
+        relevance_score=9.0,
+        authority_score=8.0,
     )
-    agent.search_manager.search = AsyncMock(return_value=[mock_result])
 
-    task = make_task(max_results=1)
-    results = await agent._fallback_research(task)
+    synthesis_json = '{"executive_summary": "RAG systems are maturing.", "key_findings": ["Chunking strategy matters", "Hybrid search outperforms dense-only"], "confidence": 0.88}'
 
-    assert len(results) == 1
-    assert isinstance(results[0], ResearchResult)
-    assert results[0].title == "Test Article"
-    assert results[0].url == "https://example.com/test"
+    agent = ResearchAgent()
+    agent.search.search = AsyncMock(return_value=[mock_result])
+    agent.analyzer.analyze_url = AsyncMock(return_value={
+        "summary": "Best practices for RAG.",
+        "key_insights": ["Chunking matters"],
+        "sentiment": "positive",
+        "content_type": "article",
+    })
+    agent.llm.call = MagicMock(return_value=synthesis_json)
 
-    cfg._settings = None
+    task = ResearchTask(topic="RAG pipelines", keywords=["retrieval", "LLM"])
+    report = await agent.research(task)
+
+    assert report.raw_mode is False
+    assert report.executive_summary == "RAG systems are maturing."
+    assert len(report.key_findings) == 2
+    assert report.confidence == 0.88
+    reset_settings()

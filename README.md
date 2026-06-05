@@ -1,20 +1,50 @@
 # Research Agent
 
-> Multi-provider web research with LangChain, concurrent search, and automatic fallback.
+> Multi-provider research pipeline. Search the web, analyze sources, synthesize findings — with your LLM of choice.
 
-Built from production code inside Agency OS. The research pipeline that powers the second agent in a 6-agent content production system.
+Extracted from Agency OS — the research stage of a 6-agent content production system. No LangChain. Works free out of the box. Plug in Anthropic, OpenAI, Groq, or Gemini for full synthesis.
+
+---
 
 ## What It Does
 
-Takes a topic + keywords. Searches across SerpAPI, Tavily, and Brave Search concurrently. Deduplicates and ranks results by relevance and authority. Returns structured research with key insights per source.
+Input: topic + keywords.
+Output: a structured `ResearchReport` with:
+- **Executive summary** — 2-3 sentence synthesis across all sources
+- **Key findings** — 5-7 actionable insights distilled by the LLM
+- **Analyzed sources** — relevance score, authority score, sentiment, content type per source
+- **Confidence score** — how well sources agree on the topic
 
-If no paid search keys are configured, falls back to DuckDuckGo at no cost.
+---
 
-## Architecture
+## LLM Providers
 
-- `src/search/providers.py` — four providers (SerpAPI, Tavily, Brave, DuckDuckGo fallback), each with rate-limit tracking. SearchProviderManager runs them concurrently via asyncio.gather and deduplicates results.
-- `src/content/analyzer.py` — fetches and parses URLs, runs AI analysis (key insights, sentiment, quality score). Falls back gracefully if LLM unavailable.
-- `src/agents/research_agent.py` — LangChain agent with two tools: web_search and analyze_content. Runs max 5 iterations. Parses structured output from agent response.
+Set any key. The router auto-detects and uses the best available.
+
+| Provider | Key | Tier | Notes |
+|----------|-----|------|-------|
+| Anthropic Claude | `ANTHROPIC_API_KEY` | Paid | Best synthesis. `claude-sonnet-4-6` default. |
+| OpenAI | `OPENAI_API_KEY` | Paid | Strong. `gpt-4o-mini` default. Set `OPENAI_MODEL=gpt-4o` for best quality. |
+| Groq | `GROQ_API_KEY` | **Free tier** | Fast. `llama-3.1-8b-instant`. Good for quick research. |
+| Google Gemini | `GEMINI_API_KEY` | **Free tier** | `gemini-1.5-flash`. Solid free option. |
+| None | — | Free | Returns raw ranked results without synthesis. |
+
+Priority order: Anthropic > OpenAI > Groq > Gemini. Override with `PREFERRED_LLM=Groq`.
+
+---
+
+## Search Providers
+
+| Provider | Key | Notes |
+|----------|-----|-------|
+| SerpAPI | `SERP_API_KEY` | Real Google results. Best coverage. |
+| Tavily | `TAVILY_API_KEY` | AI-curated. High relevance. |
+| Brave Search | `BRAVE_SEARCH_API_KEY` | Privacy-focused. Good fallback. |
+| DuckDuckGo | — | No key needed. Auto-used when no paid key is set. |
+
+Multiple providers run concurrently. Results are deduplicated and ranked.
+
+---
 
 ## Quick Start
 
@@ -22,31 +52,54 @@ If no paid search keys are configured, falls back to DuckDuckGo at no cost.
 git clone https://github.com/shubham0086/research-agent
 cd research-agent
 pip install -r requirements.txt
-
 cp .env.example .env
-# edit .env — at minimum set OPENAI_API_KEY
-# leave all keys blank to run in free DuckDuckGo fallback mode
 
+# Zero-key mode (DuckDuckGo + raw results — works immediately):
 python demo/run.py
+
+# Free synthesis via Groq (console.groq.com):
+echo "GROQ_API_KEY=gsk_yourkey" >> .env
+python demo/run.py
+
+# Best quality via Anthropic:
+echo "ANTHROPIC_API_KEY=sk-ant-yourkey" >> .env
+python demo/run.py --topic "autonomous agent memory systems" --depth deep
 ```
 
-Run tests:
+---
+
+## Architecture
+
+```
+ResearchAgent.research(task)
+    ├── SearchProviderManager     (concurrent across all providers)
+    ├── ContentAnalyzer × N       (concurrent URL fetch + analysis)
+    └── LLMRouter.call()          (Anthropic > OpenAI > Groq > Gemini)
+              → ResearchReport
+```
+
+- `src/llm/router.py` — provider-agnostic LLM router, auto-cascade on failure
+- `src/search/providers.py` — four providers, concurrent search, URL dedup + ranking
+- `src/content/analyzer.py` — URL fetch, noise removal, per-source AI analysis
+- `src/agents/research_agent.py` — pipeline orchestration and report synthesis
+
+---
+
+## Tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v  # 9 tests
 ```
 
-## Environment Variables
+Covers: LLM router detection + cascade, search deduplication, raw mode, synthesized report structure.
 
-| Variable | Required | Notes |
-|---|---|---|
-| `OPENAI_API_KEY` | No | Enables AI analysis and the full agent loop |
-| `SERP_API_KEY` | No | SerpAPI for Google results |
-| `TAVILY_API_KEY` | No | Tavily AI-curated search |
-| `BRAVE_SEARCH_API_KEY` | No | Brave Search |
+---
 
-With no keys set: DuckDuckGo fallback + no AI analysis. With only `OPENAI_API_KEY`: AI analysis but DuckDuckGo search. Paid search keys are fully optional.
+## Where This Fits in Agency OS
 
-## What Agency OS Builds On Top
+Stage 2 of the 6-agent pipeline:
+```
+Brief Intake → [Research Agent] → Content Strategist → Creator → QA → Formatter
+```
 
-This agent is the research stage of a 6-agent pipeline. See [Agency OS](https://github.com/shubham0086/agency-os) for how Research -> Content Strategist -> Creator -> QA -> Formatter are chained together with disk-persistent DAG orchestration.
+See [Agency OS](https://github.com/shubham0086/agency-os) for the full orchestration layer. The SaaS engine that runs the pipeline: [Agentic SaaS Boilerplate](https://github.com/shubham0086/agentic-saas-boilerplate).
