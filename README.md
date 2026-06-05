@@ -1,8 +1,8 @@
-# Research Agent
+﻿# Research Agent
 
-> Multi-provider research pipeline. Search the web, analyze sources, synthesize findings — with your LLM of choice.
+> Multi-provider research pipeline. Search the web, analyze sources, synthesize findings: with your LLM of choice.
 
-Extracted from Agency OS — the research stage of a 6-agent content production system. No LangChain. Works free out of the box. Plug in Anthropic, OpenAI, Groq, or Gemini for full synthesis.
+Extracted from Agency OS: the research stage of a 6-agent content production system. No LangChain. Works free out of the box. Plug in Anthropic, OpenAI, Groq, or Gemini for full synthesis.
 
 ---
 
@@ -10,10 +10,10 @@ Extracted from Agency OS — the research stage of a 6-agent content production 
 
 Input: topic + keywords.
 Output: a structured `ResearchReport` with:
-- **Executive summary** — 2-3 sentence synthesis across all sources
-- **Key findings** — 5-7 actionable insights distilled by the LLM
-- **Analyzed sources** — relevance score, authority score, sentiment, content type per source
-- **Confidence score** — how well sources agree on the topic
+- **Executive summary**: 2-3 sentence synthesis across all sources
+- **Key findings**: 5-7 actionable insights distilled by the LLM
+- **Analyzed sources**: relevance score, authority score, sentiment, content type per source
+- **Confidence score**: how well sources agree on the topic
 
 ---
 
@@ -27,7 +27,7 @@ Set any key. The router auto-detects and uses the best available.
 | OpenAI | `OPENAI_API_KEY` | Paid | Strong. `gpt-4o-mini` default. Set `OPENAI_MODEL=gpt-4o` for best quality. |
 | Groq | `GROQ_API_KEY` | **Free tier** | Fast. `llama-3.1-8b-instant`. Good for quick research. |
 | Google Gemini | `GEMINI_API_KEY` | **Free tier** | `gemini-1.5-flash`. Solid free option. |
-| None | — | Free | Returns raw ranked results without synthesis. |
+| None |: | Free | Returns raw ranked results without synthesis. |
 
 Priority order: Anthropic > OpenAI > Groq > Gemini. Override with `PREFERRED_LLM=Groq`.
 
@@ -40,7 +40,7 @@ Priority order: Anthropic > OpenAI > Groq > Gemini. Override with `PREFERRED_LLM
 | SerpAPI | `SERP_API_KEY` | Real Google results. Best coverage. |
 | Tavily | `TAVILY_API_KEY` | AI-curated. High relevance. |
 | Brave Search | `BRAVE_SEARCH_API_KEY` | Privacy-focused. Good fallback. |
-| DuckDuckGo | — | No key needed. Auto-used when no paid key is set. |
+| DuckDuckGo |: | No key needed. Auto-used when no paid key is set. |
 
 Multiple providers run concurrently. Results are deduplicated and ranked.
 
@@ -54,7 +54,7 @@ cd research-agent
 pip install -r requirements.txt
 cp .env.example .env
 
-# Zero-key mode (DuckDuckGo + raw results — works immediately):
+# Zero-key mode (DuckDuckGo + raw results: works immediately):
 python demo/run.py
 
 # Free synthesis via Groq (console.groq.com):
@@ -78,10 +78,10 @@ ResearchAgent.research(task)
               → ResearchReport
 ```
 
-- `src/llm/router.py` — provider-agnostic LLM router, auto-cascade on failure
-- `src/search/providers.py` — four providers, concurrent search, URL dedup + ranking
-- `src/content/analyzer.py` — URL fetch, noise removal, per-source AI analysis
-- `src/agents/research_agent.py` — pipeline orchestration and report synthesis
+- `src/llm/router.py`: provider-agnostic LLM router, auto-cascade on failure
+- `src/search/providers.py`: four providers, concurrent search, URL dedup + ranking
+- `src/content/analyzer.py`: URL fetch, noise removal, per-source AI analysis
+- `src/agents/research_agent.py`: pipeline orchestration and report synthesis
 
 ---
 
