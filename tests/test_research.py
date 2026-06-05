@@ -24,51 +24,65 @@ def reset_settings():
 # LLMRouter tests
 # ---------------------------------------------------------------------------
 
+ALL_PROVIDER_KEYS = [
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+    "MINIMAX_API_KEY", "OPENROUTER_API_KEY", "NIM_API_KEY", "SILICONFLOW_API_KEY",
+    "DEEPSEEK_API_KEY",
+]
+
+
 def test_router_no_keys_returns_unavailable(monkeypatch):
-    """Router with no keys configured should report unavailable."""
-    for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
+    """Router with no cloud keys and Ollama disabled should report unavailable."""
+    for key in ALL_PROVIDER_KEYS:
         monkeypatch.delenv(key, raising=False)
-    router = LLMRouter()
-    assert router.available is False
-    assert router.provider_name is None
-    assert router.tier == "none"
+    # Patch _available to return False for ollama too (simulate no local instance)
+    from src.llm import router as r
+    original = r._available
+    r._available = lambda p: False
+    try:
+        router = LLMRouter()
+        assert router.available is False
+        assert router.provider_name is None
+        assert router.tier == "none"
+    finally:
+        r._available = original
 
 
 def test_router_detects_anthropic_key(monkeypatch):
-    """Router should pick Anthropic when ANTHROPIC_API_KEY is set."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-    for key in ["OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
+    """Router should pick Anthropic when ANTHROPIC_API_KEY is set and others are absent."""
+    for key in ALL_PROVIDER_KEYS:
         monkeypatch.delenv(key, raising=False)
-    router = LLMRouter()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    router = LLMRouter(preferred_provider="anthropic")
     assert router.available is True
-    assert router.provider_name == "Anthropic"
+    assert router.provider_name == "anthropic"
     assert router.tier == "paid"
 
 
 def test_router_falls_back_to_groq_when_no_paid_key(monkeypatch):
-    """Router should fall back to Groq (free) when no paid keys are set."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    """Router should use Groq (free) when only GROQ_API_KEY is set."""
+    for key in ALL_PROVIDER_KEYS:
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    router = LLMRouter()
-    assert router.provider_name == "Groq"
+    router = LLMRouter(preferred_provider="groq")
+    assert router.provider_name == "groq"
     assert router.tier == "free"
 
 
 def test_router_status_shows_all_providers(monkeypatch):
-    """status() should list all four providers with their configured state."""
+    """status() should list all 10 providers (9 cloud + ollama)."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-    for key in ["OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"]:
-        monkeypatch.delenv(key, raising=False)
     router = LLMRouter()
     status = router.status()
     assert "active_provider" in status
     assert "available_providers" in status
-    assert len(status["available_providers"]) == 4
+    assert len(status["available_providers"]) == 10
     names = [p["name"] for p in status["available_providers"]]
-    assert "Anthropic" in names
-    assert "Groq" in names
+    assert "anthropic" in names
+    assert "groq" in names
+    assert "openrouter" in names
+    assert "minimax" in names
+    assert "ollama" in names
 
 
 def test_router_call_returns_none_when_unavailable(monkeypatch):
