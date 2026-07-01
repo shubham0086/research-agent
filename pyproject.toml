@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research-agent"
+version = "0.1.0"
+description = "Machine OS spoke: privacy-first web research (anonymous DuckDuckGo raw mode by default) as an MCP server."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+# Console entry so the spoke is launchable via:
+#   uvx --from <path-or-git> research-agent
+research-agent = "src.mcp_server:main"
+
+[tool.setuptools]
+packages = ["src", "src.agents", "src.search", "src.content", "src.llm"]
