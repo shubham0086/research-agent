@@ -107,7 +107,21 @@ async def _dispatch(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             depth=args.get("depth", "standard"),
         )
         report = await ResearchAgent().research(task)
-        return asdict(report)
+        # Web content is untrusted: scrub hidden injection carriers and quarantine
+        # a payload that scores as an active prompt-injection, rather than feeding a
+        # poisoned blob to the calling agent (self-defense when run as a standalone
+        # spoke, outside the gateway). See sanitizer.py / SOVEREIGN-AGENT-SECURITY.
+        from .sanitizer import scrub_output
+        cleaned, meta = scrub_output(asdict(report))
+        if meta["quarantined"]:
+            return {
+                "quarantined": True,
+                "risk": meta["risk"],
+                "topic": args["topic"],
+                "note": "Web results contained a likely prompt-injection and were held for review "
+                        "instead of being returned. Re-run with a narrower query or inspect sources manually.",
+            }
+        return cleaned
 
     raise ValueError(f"Unknown tool: {name}")
 
