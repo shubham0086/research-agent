@@ -4,7 +4,8 @@ Multi-provider LLM router — extracted from production ace-engine/provider_rout
 Key design:
   - Most providers (MiniMax, OpenRouter, NVIDIA NIM, SiliconFlow, DeepSeek, OpenAI)
     use the OpenAI-compatible /v1/chat/completions API — one HTTP call handles all.
-  - Gemini, Anthropic, and Ollama have their own native API shapes.
+  - Sarvam, Gemini, Anthropic, and Ollama have their own native API shapes.
+  - Sarvam is sovereign-first: sarvam-105b on /v1 for all task classes.
   - Task-class chains: each task type (research, code, content, simple) has its own
     provider priority order. Research routes through content-optimized providers first.
   - Session-level circuit breaker: once a provider exhausts all its models in a session,
@@ -13,9 +14,14 @@ Key design:
 
 Provider tiers:
   Free:   OpenRouter (:free suffix models), MiniMax (OpenCode Zen), Groq, Gemini Flash, Ollama
-  Paid:   Anthropic, OpenAI, NVIDIA NIM, SiliconFlow, DeepSeek, Bedrock
+  Paid:   Sarvam, Anthropic, OpenAI, NVIDIA NIM, SiliconFlow, DeepSeek, Bedrock
 
 Set the env vars for any providers you have. Router auto-detects and cascades.
+
+Sarvam key routing:
+  SARVAM_API_KEY       → /v1 (sarvam-105b) — sovereign-first for all task classes
+  SARVAM_BETA_API_KEY  → /v2 (GLM-5.2, Gemma 4) — beta-whitelisted, 4096 max_tokens cap
+  Docs: https://docs.sarvam.ai/api/getting-started/models
 """
 import asyncio
 import logging
@@ -40,6 +46,11 @@ RETRY_DELAY = 2.0
 
 def _build_model_chains() -> Dict[str, List[str]]:
     return {
+        # Sarvam — sovereign-first. sarvam-105b on /v1 (same key, high max_tokens).
+        # GLM-5.2 on /v2 needs SARVAM_BETA_API_KEY (beta-whitelisted, 4096 cap).
+        "sarvam": [
+            os.getenv("SARVAM_MODEL", "sarvam-105b"),
+        ],
         # MiniMax via OpenCode Zen (free)
         "minimax": [
             os.getenv("MINIMAX_MODEL", "MiniMax-Text-01"),
@@ -101,10 +112,10 @@ def _build_model_chains() -> Dict[str, List[str]]:
 # ---------------------------------------------------------------------------
 
 PROVIDER_CHAINS: Dict[str, List[str]] = {
-    "research": ["minimax", "openrouter", "groq", "gemini", "deepseek", "siliconflow", "nim", "openai", "anthropic", "ollama"],
-    "content":  ["minimax", "gemini", "openrouter", "groq", "openai", "anthropic", "siliconflow", "nim", "ollama"],
-    "code":     ["deepseek", "siliconflow", "nim", "openrouter", "openai", "gemini", "anthropic", "ollama"],
-    "simple":   ["minimax", "groq", "openrouter", "gemini", "openai", "ollama"],
+    "research": ["sarvam", "minimax", "openrouter", "groq", "gemini", "deepseek", "siliconflow", "nim", "openai", "anthropic", "ollama"],
+    "content":  ["sarvam", "minimax", "gemini", "openrouter", "groq", "openai", "anthropic", "siliconflow", "nim", "ollama"],
+    "code":     ["sarvam", "deepseek", "siliconflow", "nim", "openrouter", "openai", "gemini", "anthropic", "ollama"],
+    "simple":   ["sarvam", "minimax", "groq", "openrouter", "gemini", "openai", "ollama"],
 }
 
 
@@ -123,6 +134,7 @@ _OAI_COMPAT: Dict[str, str] = {
 }
 
 _ENV_KEYS: Dict[str, str] = {
+    "sarvam":     "SARVAM_API_KEY",
     "minimax":    "MINIMAX_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "nim":        "NIM_API_KEY",
@@ -136,6 +148,7 @@ _ENV_KEYS: Dict[str, str] = {
 }
 
 PROVIDER_TIMEOUTS: Dict[str, int] = {
+    "sarvam":     60,
     "minimax":    60,
     "openrouter": 45,
     "nim":        45,
@@ -149,7 +162,9 @@ PROVIDER_TIMEOUTS: Dict[str, int] = {
 }
 
 # Cost per 1M tokens (input, output) — 0.0 = free tier
+# Sarvam pricing: https://docs.sarvam.ai/api/getting-started/pricing
 MODEL_PRICING: Dict[str, Dict[str, Dict[str, float]]] = {
+    "sarvam":    {"sarvam-105b": {"in": 0.0, "out": 0.0}},  # trial credits
     "openai":    {"gpt-4o-mini": {"in": 0.15, "out": 0.60}, "gpt-4o": {"in": 2.50, "out": 10.00}},
     "anthropic": {"claude-sonnet-4-6": {"in": 3.00, "out": 15.00}, "claude-haiku-4-5": {"in": 0.80, "out": 4.00}},
     "gemini":    {"gemini-2.0-flash": {"in": 0.075, "out": 0.30}, "gemini-1.5-flash": {"in": 0.075, "out": 0.30}},
@@ -212,6 +227,51 @@ async def _call_oai_compat(
     content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
     if not content:
         raise RuntimeError(f"{provider} returned empty response")
+
+    usage = data.get("usage", {})
+    return content, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+
+
+async def _call_sarvam(
+    model: str, messages: List[Dict], temperature: float, max_tokens: int
+) -> tuple[str, int, int]:
+    """Sarvam-105b via /v1/chat/completions — OpenAI-compatible but custom auth header.
+
+    Uses api-subscription-key (not Bearer). sarvam-105b supports reasoning_effort
+    but we leave it unset here — the router is for general research, not deep
+    strategy. Set SARVAM_API_KEY in env.
+    Docs: https://docs.sarvam.ai/api/api-guides-tutorials/chat-completion/overview
+    """
+    key = os.getenv("SARVAM_API_KEY", "")
+    timeout = PROVIDER_TIMEOUTS.get("sarvam", 60)
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            "https://api.sarvam.ai/v1/chat/completions",
+            headers={
+                "api-subscription-key": key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+    if not resp.is_success:
+        raise RuntimeError(f"Sarvam HTTP {resp.status_code}: {resp.text[:200]}")
+
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+    if not content:
+        raise RuntimeError("Sarvam returned empty response")
 
     usage = data.get("usage", {})
     return content, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
@@ -315,6 +375,8 @@ async def _dispatch(
 ) -> tuple[str, int, int]:
     if provider in _OAI_COMPAT:
         return await _call_oai_compat(provider, model, messages, temperature, max_tokens)
+    if provider == "sarvam":
+        return await _call_sarvam(model, messages, temperature, max_tokens)
     if provider == "anthropic":
         return await _call_anthropic(model, messages, temperature, max_tokens)
     if provider == "gemini":
@@ -360,8 +422,9 @@ async def chat(
     if not usable:
         raise RuntimeError(
             f"No providers available for task_class='{task_class}'. "
-            "Set at least one of: GROQ_API_KEY (free), GEMINI_API_KEY (free), "
-            "ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or run Ollama locally."
+            "Set at least one of: SARVAM_API_KEY, GROQ_API_KEY (free), "
+            "GEMINI_API_KEY (free), ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+            "OPENROUTER_API_KEY, or run Ollama locally."
         )
 
     failures = []
@@ -401,10 +464,10 @@ def available_providers() -> List[Dict[str, Any]]:
             "name": p,
             "configured": _available(p),
             "env_key": _ENV_KEYS.get(p, "none required"),
-            "tier": "free" if p in {"minimax", "openrouter", "groq", "ollama"} else "paid",
+            "tier": "free" if p in {"sarvam", "minimax", "openrouter", "groq", "ollama"} else "paid",
             "in_chain": {tc: (p in chain) for tc, chain in PROVIDER_CHAINS.items()},
         }
-        for p in list(_OAI_COMPAT.keys()) + ["anthropic", "gemini", "ollama"]
+        for p in list(_OAI_COMPAT.keys()) + ["sarvam", "anthropic", "gemini", "ollama"]
     ]
 
 
@@ -441,7 +504,7 @@ class LLMRouter:
         name = self.provider_name
         if not name:
             return "none"
-        return "free" if name in {"minimax", "openrouter", "groq", "ollama"} else "paid"
+        return "free" if name in {"sarvam", "minimax", "openrouter", "groq", "ollama"} else "paid"
 
     def call(self, messages: List[Dict[str, str]], model: Optional[str] = None) -> Optional[str]:
         """Synchronous call — runs the async chat() in a new event loop."""

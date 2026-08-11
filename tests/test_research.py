@@ -25,7 +25,7 @@ def reset_settings():
 # ---------------------------------------------------------------------------
 
 ALL_PROVIDER_KEYS = [
-    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+    "SARVAM_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
     "MINIMAX_API_KEY", "OPENROUTER_API_KEY", "NIM_API_KEY", "SILICONFLOW_API_KEY",
     "DEEPSEEK_API_KEY",
 ]
@@ -59,6 +59,17 @@ def test_router_detects_anthropic_key(monkeypatch):
     assert router.tier == "paid"
 
 
+def test_router_detects_sarvam_key(monkeypatch):
+    """Router should pick Sarvam (sovereign-first) when SARVAM_API_KEY is set."""
+    for key in ALL_PROVIDER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SARVAM_API_KEY", "sk_test")
+    router = LLMRouter()
+    assert router.available is True
+    assert router.provider_name == "sarvam"
+    assert router.tier == "free"
+
+
 def test_router_falls_back_to_groq_when_no_paid_key(monkeypatch):
     """Router should use Groq (free) when only GROQ_API_KEY is set."""
     for key in ALL_PROVIDER_KEYS:
@@ -70,14 +81,15 @@ def test_router_falls_back_to_groq_when_no_paid_key(monkeypatch):
 
 
 def test_router_status_shows_all_providers(monkeypatch):
-    """status() should list all 10 providers (9 cloud + ollama)."""
+    """status() should list all 11 providers (10 cloud + ollama)."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     router = LLMRouter()
     status = router.status()
     assert "active_provider" in status
     assert "available_providers" in status
-    assert len(status["available_providers"]) == 10
+    assert len(status["available_providers"]) == 11
     names = [p["name"] for p in status["available_providers"]]
+    assert "sarvam" in names
     assert "anthropic" in names
     assert "groq" in names
     assert "openrouter" in names

@@ -1,7 +1,8 @@
 """
 Config — reads from environment variables.
-Supports all four LLM providers and three search providers.
+Supports Sarvam (sovereign-first) plus all other LLM providers and search providers.
 
+Sovereign tier: set SARVAM_API_KEY for sarvam-105b on /v1 (sovereign-first for all tasks).
 Free tier: set GROQ_API_KEY or GEMINI_API_KEY (both have free tiers).
 Paid tier: set ANTHROPIC_API_KEY or OPENAI_API_KEY for best research quality.
 """
@@ -12,13 +13,15 @@ from typing import List, Optional
 
 @dataclass
 class Settings:
-    # LLM providers — set whichever you have (priority: Anthropic > OpenAI > Groq > Gemini)
+    # LLM providers — set whichever you have (priority: Sarvam > Anthropic > OpenAI > Groq > Gemini)
+    sarvam_api_key:    Optional[str] = field(default_factory=lambda: os.getenv("SARVAM_API_KEY"))
     anthropic_api_key: Optional[str] = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY"))
     openai_api_key:    Optional[str] = field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
     groq_api_key:      Optional[str] = field(default_factory=lambda: os.getenv("GROQ_API_KEY"))
     gemini_api_key:    Optional[str] = field(default_factory=lambda: os.getenv("GEMINI_API_KEY"))
 
     # Model overrides (optional — defaults are set in the router per provider)
+    sarvam_model:    str = field(default_factory=lambda: os.getenv("SARVAM_MODEL", "sarvam-105b"))
     anthropic_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"))
     openai_model:    str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     groq_model:      str = field(default_factory=lambda: os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"))
@@ -39,6 +42,7 @@ class Settings:
     @property
     def has_any_llm(self) -> bool:
         return any([
+            self.sarvam_api_key,
             self.anthropic_api_key,
             self.openai_api_key,
             self.groq_api_key,
@@ -48,6 +52,7 @@ class Settings:
     @property
     def available_llm_providers(self) -> List[str]:
         providers = []
+        if self.sarvam_api_key:    providers.append("Sarvam")
         if self.anthropic_api_key: providers.append("Anthropic")
         if self.openai_api_key:    providers.append("OpenAI")
         if self.groq_api_key:      providers.append("Groq")

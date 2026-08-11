@@ -238,7 +238,7 @@ class ResearchAgent:
             topic=task.topic,
             executive_summary=(
                 f"Raw results for '{task.topic}'. "
-                "Set GROQ_API_KEY (free) or ANTHROPIC_API_KEY for synthesized reports."
+                "Set SARVAM_API_KEY, GROQ_API_KEY (free), or ANTHROPIC_API_KEY for synthesized reports."
             ),
             key_findings=[s.summary for s in sources[:5] if s.summary],
             sources=sources,
